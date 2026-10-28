@@ -1,6 +1,6 @@
 export interface IVolunteerPayload {
   name: string;
-  role?: "ADMIN" | "TEAM" | "VOLUNTEER" | "CUSTOMER";
+  role?: "ADMIN" | "TEAM" | "VOLUNTEER" | "CUSTOMER" | "PATIENT";
   mobile?: string | number;
   username?: string;
   password?: string;

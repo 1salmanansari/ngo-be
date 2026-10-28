@@ -1,7 +1,7 @@
 import mongoose, { Schema, Document } from "mongoose";
 import { v4 as uuidv4 } from "uuid";
 
-export type UserRole = "ADMIN" | "TEAM" | "VOLUNTEER" | "CUSTOMER";
+export type UserRole = "ADMIN" | "TEAM" | "VOLUNTEER" | "CUSTOMER" | "PATIENT";
 
 export interface IUser extends Document {
   id: string;
@@ -28,7 +28,7 @@ const userSchema = new Schema<IUser>(
     password: { type: String, required: true },
     role: {
       type: String,
-      enum: ["ADMIN", "TEAM", "VOLUNTEER", "CUSTOMER"],
+      enum: ["ADMIN", "TEAM", "VOLUNTEER", "CUSTOMER", "PATIENT"],
       default: "VOLUNTEER",
     },
     created: { type: Number, default: () => Date.now() },
