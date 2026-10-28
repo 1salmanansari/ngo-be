@@ -1,0 +1,45 @@
+{
+  "name": "ngo-be",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "High-performance Pragati Foundation Camp Backend API with Express, MongoDB, Redis, JWT & RBAC",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "seed": "tsx src/scripts/seedData.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "test:api": "node tests/api_test.js",
+    "test:load": "node tests/load_test.js"
+  },
+  "keywords": ["express", "mongodb", "redis", "jwt", "rbac", "healthcare", "ngo"],
+  "author": "Salman Ansari",
+  "license": "ISC",
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "compression": "^1.7.5",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "helmet": "^8.0.0",
+    "ioredis": "^5.4.2",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.9.5",
+    "morgan": "^1.10.0",
+    "uuid": "^11.0.5"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/compression": "^1.7.5",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/jsonwebtoken": "^9.0.7",
+    "@types/morgan": "^1.9.9",
+    "@types/node": "^22.10.7",
+    "@types/uuid": "^10.0.0",
+    "autocannon": "^8.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}
