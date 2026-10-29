@@ -1,0 +1,303 @@
+name: Deploy Backend to EC2
+
+on:
+  push:
+    branches:
+      - dev
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-deploy:
+    name: Build & Deploy via AWS SSM
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
+        with:
+          node-version: 20
+
+      - name: Install Dependencies and Build Locally
+        run: |
+          echo "Verifying build on GitHub Actions runner..."
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+          npm run build
+
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ap-south-1
+          audience: sts.amazonaws.com
+
+      - name: Deploy to EC2 via AWS Systems Manager
+        run: |
+          INSTANCE_ID="i-05b68ca0293ebbf4"
+          AWS_REGION="ap-south-1"
+
+          # Assemble self-contained deployment script for EC2
+          DEPLOY_PAYLOAD=$(cat << 'EOF' | base64 | tr -d '\r\n'
+          #!/bin/bash
+          set -euo pipefail
+
+          DEPLOY_SCRIPT_PATH="/tmp/ngo-be-deploy-$$.sh"
+
+          cat << 'REMOTE_SCRIPT_EOF' > "$DEPLOY_SCRIPT_PATH"
+          #!/bin/bash
+          set -euo pipefail
+
+          APP_DIR="/home/ec2-user/ngo-be"
+          PM2_APP_NAME="ngo-be"
+          HEALTH_URL="http://127.0.0.1:8000/api/v1/health"
+
+          echo "======================================================="
+          echo "Starting Deployment on EC2 Instance"
+          echo "Target Directory: $APP_DIR"
+          echo "Timestamp:        $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          echo "User executing:   $(whoami)"
+          echo "======================================================="
+
+          # Pre-flight Check 1: Directory existence
+          if [ ! -d "$APP_DIR" ]; then
+            echo "ERROR: Application directory '$APP_DIR' does not exist." >&2
+            exit 1
+          fi
+
+          cd "$APP_DIR"
+
+          # Pre-flight Check 2: Verify current branch is 'dev'
+          CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          echo "Current git branch: $CURRENT_BRANCH"
+          if [ "$CURRENT_BRANCH" != "dev" ]; then
+            echo "ERROR: Active branch is '$CURRENT_BRANCH', expected 'dev'." >&2
+            echo "Aborting deployment to avoid deploying to or overwriting the wrong branch." >&2
+            exit 1
+          fi
+
+          # Pre-flight Check 3: Verify clean working tree (no uncommitted tracked changes)
+          if ! git diff-index --quiet HEAD --; then
+            echo "ERROR: Working tree has uncommitted changes in tracked files." >&2
+            git status --short >&2
+            echo "Aborting deployment to prevent losing local modifications." >&2
+            exit 1
+          fi
+
+          # Pre-flight Check 4: Verify .env file is preserved
+          if [ -f .env ]; then
+            echo "✓ Environment file (.env) exists and will be preserved."
+          else
+            echo "WARNING: .env file was not found in $APP_DIR."
+          fi
+
+          # Pre-flight Check 5: Fetch latest origin/dev and check for divergence
+          echo "Fetching latest changes from origin/dev..."
+          git fetch origin dev
+
+          LOCAL_COMMIT=$(git rev-parse HEAD)
+          REMOTE_COMMIT=$(git rev-parse origin/dev)
+          BASE_COMMIT=$(git merge-base HEAD origin/dev)
+
+          echo "Local HEAD:     $LOCAL_COMMIT"
+          echo "Target remote:  $REMOTE_COMMIT"
+          echo "Common base:    $BASE_COMMIT"
+
+          if [ "$LOCAL_COMMIT" != "$BASE_COMMIT" ]; then
+            echo "ERROR: Local branch has unpushed commits ($LOCAL_COMMIT) not present in origin/dev ($REMOTE_COMMIT)." >&2
+            echo "Aborting deployment to prevent overwriting or discarding out-of-band changes." >&2
+            exit 1
+          fi
+
+          # Setup Rollback / Backup state
+          PREV_COMMIT="$LOCAL_COMMIT"
+          HAS_DIST_BACKUP="false"
+          if [ -d dist ]; then
+            rm -rf dist.backup
+            cp -r dist dist.backup
+            HAS_DIST_BACKUP="true"
+            echo "✓ Backed up existing dist/ build directory."
+          fi
+
+          rollback() {
+            local exit_code=$?
+            echo "=======================================================" >&2
+            echo "Deployment step failed (Exit Code: $exit_code). Initiating Rollback..." >&2
+            echo "=======================================================" >&2
+
+            if [ -n "$PREV_COMMIT" ] && [ "$(git rev-parse HEAD 2>/dev/null || true)" != "$PREV_COMMIT" ]; then
+              echo "Restoring git state to previous commit $PREV_COMMIT..." >&2
+              git checkout "$PREV_COMMIT" || git merge --abort || true
+            fi
+
+            if [ "$HAS_DIST_BACKUP" = "true" ] && [ -d dist.backup ]; then
+              echo "Restoring previous dist/ build from backup..." >&2
+              rm -rf dist
+              cp -r dist.backup dist
+            fi
+
+            if command -v pm2 >/dev/null 2>&1 && pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1; then
+              echo "Reloading PM2 process '$PM2_APP_NAME' with previous state..." >&2
+              pm2 reload "$PM2_APP_NAME" --update-env || pm2 restart "$PM2_APP_NAME" --update-env || true
+            fi
+
+            echo "Rollback completed. Running application preserved." >&2
+            exit "$exit_code"
+          }
+
+          trap rollback ERR
+
+          # Step 1: Merge origin/dev cleanly (fast-forward only)
+          if [ "$LOCAL_COMMIT" != "$REMOTE_COMMIT" ]; then
+            echo "Fast-forward merging origin/dev ($REMOTE_COMMIT)..."
+            git merge --ff-only origin/dev
+          else
+            echo "Working tree is already up-to-date with origin/dev."
+          fi
+
+          # Step 2: Install dependencies
+          echo "Installing dependencies..."
+          if [ -f package-lock.json ]; then
+            npm ci || npm install
+          else
+            npm install
+          fi
+
+          # Step 3: Build TypeScript application
+          echo "Building application on server (npm run build)..."
+          npm run build
+
+          if [ ! -d dist ] || [ ! -f dist/server.js ]; then
+            echo "ERROR: Build output dist/server.js not found after npm run build." >&2
+            exit 1
+          fi
+
+          # Step 4: Reload existing PM2 process
+          echo "Reloading PM2 process '$PM2_APP_NAME'..."
+          if command -v pm2 >/dev/null 2>&1 && pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1; then
+            pm2 reload "$PM2_APP_NAME" --update-env
+          else
+            echo "PM2 process '$PM2_APP_NAME' is not currently registered; starting it..."
+            pm2 start dist/server.js --name "$PM2_APP_NAME" --update-env
+          fi
+
+          # Step 5: Verify health endpoint
+          echo "Verifying health endpoint at $HEALTH_URL..."
+          HEALTH_VERIFIED=false
+          for i in $(seq 1 15); do
+            sleep 2
+            RAW_RESP=$(curl -s -S -w "\n%{http_code}" "$HEALTH_URL" 2>/dev/null || true)
+            HTTP_CODE=$(echo "$RAW_RESP" | tail -n1)
+            BODY=$(echo "$RAW_RESP" | sed '$d')
+
+            if [ "$HTTP_CODE" = "200" ] && echo "$BODY" | grep -q '"status"[[:space:]]*:[[:space:]]*"UP"'; then
+              echo "✓ Health check passed on attempt $i (HTTP $HTTP_CODE):"
+              echo "  $BODY"
+              HEALTH_VERIFIED=true
+              break
+            fi
+            echo "Attempt $i/15: Received HTTP $HTTP_CODE: $BODY. Retrying in 2s..."
+          done
+
+          if [ "$HEALTH_VERIFIED" != "true" ]; then
+            echo "ERROR: Health check failed: did not receive HTTP 200 with status UP." >&2
+            exit 1
+          fi
+
+          # Clean up backup after confirmed healthy deployment
+          trap - ERR
+          rm -rf dist.backup
+          echo "======================================================="
+          echo "Deployment successfully completed and verified healthy!"
+          echo "======================================================="
+          REMOTE_SCRIPT_EOF
+
+          chmod 700 "$DEPLOY_SCRIPT_PATH"
+          chown ec2-user:ec2-user "$DEPLOY_SCRIPT_PATH" 2>/dev/null || true
+
+          # Execute as ec2-user login shell if running under root SSM daemon
+          if [ "$(id -u)" -eq 0 ]; then
+            su - ec2-user -c "bash -l $DEPLOY_SCRIPT_PATH"
+          else
+            bash -l "$DEPLOY_SCRIPT_PATH"
+          fi
+          SCRIPT_EXIT=$?
+
+          rm -f "$DEPLOY_SCRIPT_PATH"
+          exit $SCRIPT_EXIT
+          EOF
+          )
+
+          echo "Sending deployment command to instance $INSTANCE_ID via AWS SSM..."
+          COMMAND_JSON=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy commit ${{ github.sha }} via GitHub Actions" \
+            --parameters "{\"commands\":[\"echo $DEPLOY_PAYLOAD | base64 -d | bash\"]}" \
+            --region "$AWS_REGION" \
+            --output json)
+
+          COMMAND_ID=$(echo "$COMMAND_JSON" | jq -r '.Command.CommandId')
+          if [ -z "$COMMAND_ID" ] || [ "$COMMAND_ID" = "null" ]; then
+            echo "::error::Failed to send SSM command to instance $INSTANCE_ID."
+            echo "$COMMAND_JSON"
+            exit 1
+          fi
+
+          echo "SSM Command dispatched. CommandId: $COMMAND_ID"
+          echo "Polling execution status..."
+
+          MAX_ATTEMPTS=60 # Up to 5 minutes (60 * 5s)
+          ATTEMPT=0
+          STATUS="Pending"
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            sleep 5
+
+            INVOCATION=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --region "$AWS_REGION" \
+              --output json 2>/dev/null || true)
+
+            STATUS=$(echo "$INVOCATION" | jq -r '.Status // "Pending"')
+            echo "[$(date -u '+%H:%M:%SZ')] Attempt $ATTEMPT/$MAX_ATTEMPTS - Status: $STATUS"
+
+            case "$STATUS" in
+              "Success")
+                echo "===================== SSM STDOUT ====================="
+                echo "$INVOCATION" | jq -r '.StandardOutputContent'
+                echo "======================================================"
+                echo "SSM Command succeeded."
+                exit 0
+                ;;
+              "Failed"|"Cancelled"|"TimedOut"|"Cancelling")
+                echo "===================== SSM STDOUT ====================="
+                echo "$INVOCATION" | jq -r '.StandardOutputContent'
+                echo "===================== SSM STDERR ====================="
+                echo "$INVOCATION" | jq -r '.StandardErrorContent'
+                echo "======================================================"
+                echo "::error::SSM Command finished with failure status: $STATUS"
+                exit 1
+                ;;
+              "InProgress"|"Pending"|"Delayed")
+                # Continue polling
+                ;;
+              *)
+                echo "Waiting for valid status response (current: $STATUS)..."
+                ;;
+            esac
+          done
+
+          echo "::error::SSM Command timed out waiting for completion after $((MAX_ATTEMPTS * 5)) seconds."
+          exit 1
