@@ -43,7 +43,7 @@ jobs:
 
       - name: Deploy to EC2 via AWS Systems Manager
         run: |
-          INSTANCE_ID="i-05b68ca0293ebbf4"
+          INSTANCE_ID="i-05b68ca0293ebbbf4"
           AWS_REGION="ap-south-1"
 
           # Assemble self-contained deployment script for EC2
