@@ -21,7 +21,7 @@ router.get("/health", (_req, res) => {
     success: true,
     status: "UP",
     timestamp: Date.now(),
-    service: "Pragati Foundation Medical Camp API",
+    service: "Pragati Foundation Medical Camp API edit",
   });
 });
 
